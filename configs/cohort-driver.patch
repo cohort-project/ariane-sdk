@@ -1,0 +1,1204 @@
+From b1bc3e3f4e4b257cf7619666a2242c47cb374414 Mon Sep 17 00:00:00 2001
+From: Arjun Vinod <arjunvinod@ucsb.edu>
+Date: Tue, 25 Apr 2023 23:16:35 -0700
+Subject: [PATCH 1/1] feat: cohort (driver)
+
+---
+ arch/riscv/include/asm/syscall.h           |   4 +
+ arch/riscv/include/uapi/asm/unistd.h       |  11 +
+ arch/riscv/kernel/sys_riscv.c              |  20 ++
+ cov                                        |  73 +++++
+ drivers/Kconfig                            |   2 +
+ drivers/Makefile                           |   1 +
+ drivers/cohort_mmu/Kconfig                 |  11 +
+ drivers/cohort_mmu/Makefile                |   6 +
+ drivers/cohort_mmu/cohort_mmu.c            | 206 ++++++++++++
+ drivers/cohort_mmu/cohort_mmu.h            | 195 +++++++++++
+ drivers/cohort_mmu/cohort_syscall.h        |   3 +
+ drivers/cohort_mmu/dcpn_compressed.h       | 361 +++++++++++++++++++++
+ drivers/cohort_mmu/dec_decoupling.h        | 125 +++++++
+ include/uapi/asm-generic/unistd.h          |   3 +-
+ scripts/dtc/dtc-lexer.l                    |   1 +
+ tools/arch/riscv/include/uapi/asm/unistd.h |  11 +
+ 16 files changed, 1032 insertions(+), 1 deletion(-)
+ create mode 100644 cov
+ create mode 100644 drivers/cohort_mmu/Kconfig
+ create mode 100644 drivers/cohort_mmu/Makefile
+ create mode 100644 drivers/cohort_mmu/cohort_mmu.c
+ create mode 100644 drivers/cohort_mmu/cohort_mmu.h
+ create mode 100644 drivers/cohort_mmu/cohort_syscall.h
+ create mode 100644 drivers/cohort_mmu/dcpn_compressed.h
+ create mode 100644 drivers/cohort_mmu/dec_decoupling.h
+
+diff --git a/arch/riscv/include/asm/syscall.h b/arch/riscv/include/asm/syscall.h
+index 384a63b86420..bda9d2a30d17 100644
+--- a/arch/riscv/include/asm/syscall.h
++++ b/arch/riscv/include/asm/syscall.h
+@@ -75,4 +75,8 @@ static inline int syscall_get_arch(struct task_struct *task)
+ }
+ 
+ asmlinkage long sys_riscv_flush_icache(uintptr_t, uintptr_t, uintptr_t);
++
++asmlinkage void sys_riscv_conf_iommu(uint64_t, uint64_t, uint64_t, uint64_t);
++asmlinkage void sys_riscv_conf_iommu_exit(void);
++
+ #endif	/* _ASM_RISCV_SYSCALL_H */
+diff --git a/arch/riscv/include/uapi/asm/unistd.h b/arch/riscv/include/uapi/asm/unistd.h
+index 73d7cdd2ec49..455c97a9f6ea 100644
+--- a/arch/riscv/include/uapi/asm/unistd.h
++++ b/arch/riscv/include/uapi/asm/unistd.h
+@@ -43,3 +43,14 @@
+ #define __NR_riscv_flush_icache (__NR_arch_specific_syscall + 15)
+ #endif
+ __SYSCALL(__NR_riscv_flush_icache, sys_riscv_flush_icache)
++
++#ifndef __NR_riscv_conf_iommu
++#define __NR_riscv_conf_iommu (__NR_arch_specific_syscall + 14)
++#endif
++
++__SYSCALL(__NR_riscv_conf_iommu, sys_riscv_conf_iommu)
++
++#ifndef __NR_riscv_conf_iommu_exit
++#define __NR_riscv_conf_iommu_exit (__NR_arch_specific_syscall + 13)
++#endif
++__SYSCALL(__NR_riscv_conf_iommu_exit, sys_riscv_conf_iommu_exit)
+\ No newline at end of file
+diff --git a/arch/riscv/kernel/sys_riscv.c b/arch/riscv/kernel/sys_riscv.c
+index 5d3f2fbeb33c..fe146e3a13f0 100644
+--- a/arch/riscv/kernel/sys_riscv.c
++++ b/arch/riscv/kernel/sys_riscv.c
+@@ -9,6 +9,9 @@
+ #include <asm/unistd.h>
+ #include <asm/cacheflush.h>
+ #include <asm-generic/mman-common.h>
++#include <asm/io.h>
++#include <linux/sched/mm.h>
++#include "../drivers/cohort_mmu/cohort_syscall.h"
+ 
+ static long riscv_sys_mmap(unsigned long addr, unsigned long len,
+ 			   unsigned long prot, unsigned long flags,
+@@ -69,3 +72,20 @@ SYSCALL_DEFINE3(riscv_flush_icache, uintptr_t, start, uintptr_t, end,
+ 
+ 	return 0;
+ }
++
++SYSCALL_DEFINE4(riscv_conf_iommu, uint64_t, c_head, uint64_t, p_head, uint64_t, acc_ptr, uint64_t, backoff_val) {
++
++	// printk("Cohort MMU syscall entered! \n");
++
++	// Call a driver for the curr proc
++	cohort_mn_register(c_head, p_head, acc_ptr, backoff_val);
++
++    return 0;
++}
++
++SYSCALL_DEFINE0(riscv_conf_iommu_exit) {
++    // printk("Cohort MMU EXIT syscall entered! \n");
++	cohort_mn_exit();
++
++    return 0;
++}
+\ No newline at end of file
+diff --git a/cov b/cov
+new file mode 100644
+index 000000000000..10163e5e3ffd
+--- /dev/null
++++ b/cov
+@@ -0,0 +1,73 @@
++The Supervisor Binary Interface(SBI) specification[1] now defines a
++base extension that provides extendability to add future extensions
++while maintaining backward compatibility with previous versions.
++The new version is defined as 0.2 and older version is marked as 0.1.
++
++This series adds following features to RISC-V Linux.
++1. Adds support for SBI v0.2
++2. A Unified calling convention implementation between 0.1 and 0.2. 
++3. SBI Hart state management extension (HSM)
++4. Ordered booting of harts
++4. CPU hotplug 
++
++Dependencies:
++The support for SBI v0.2 and HSM extension is already available in OpenSBI
++master.
++
++[1] https://github.com/riscv/riscv-sbi-doc/blob/master/riscv-sbi.adoc
++
++The patches are also available in following github repositery.
++
++Linux Kernel: https://github.com/atishp04/linux/tree/sbi_v0.2_v10
++
++Patches 1-5 implements the SBI v0.2 and unified calling convention.
++Patches 6-7 adds a cpu_ops method that allows different booting protocols
++dynamically.
++Patches 9-10 adds HSM extension and ordered hart booting support.
++Patche  11 adds cpu hotplug support.
++
++Changes from v9->10:
++1. Minor copyright fixes.
++2. Renaming of HSM extension definitions to match the spec.
++ 
++Changes from v8->v9:
++1. Added a sliding window hart base method to support larger hart masks.
++2. Added a callback to disable interrupts when cpu go offline.
++3. Made the HSM extension series more modular.
++
++Changes from v7-v8:
++1. Refactored to code to have modular cpu_ops calls.
++2. Refactored HSM extension from sbi.c to cpu_ops_sbi.c.
++3. Fix plic driver to handle cpu hotplug.
++
++Changes from v6-v7:
++1. Rebased on v5.5
++2. Fixed few compilation issues for !CONFIG_SMP and !CONFIG_RISCV_SBI
++3. Added SBI HSM extension
++4. Add CPU hotplug support
++
++Changes from v5->v6
++1. Fixed few compilation issues around config.
++2. Fixed hart mask generation issues for RFENCE & IPI extensions.
++
++Changes from v4->v5
++1. Fixed few minor comments related to static & inline.
++2. Make sure that every patch is boot tested individually.
++
++Changes from v3->v4.
++1. Rebased on for-next.
++2. Fixed issuses with checkpatch --strict.
++3. Unfied all IPI/fence related functions.
++4. Added Hfence related SBI calls.
++
++Changes from v2->v3.
++1. Moved v0.1 extensions to a new config.
++2. Added support for relacement extensions of v0.1 extensions.
++
++Changes from v1->v2
++1. Removed the legacy calling convention.
++2. Moved all SBI related calls to sbi.c.
++3. Moved all SBI related macros to uapi.
++
++option-subject Add support for SBI v0.2 and CPU hotplug
++option-prefix PATCH v10
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+index 968bd0a6fd78..19cdd06f2d8d 100644
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -241,4 +241,6 @@ source "drivers/peci/Kconfig"
+ 
+ source "drivers/hte/Kconfig"
+ 
++source "drivers/cohort_mmu/Kconfig"
++
+ endmenu
+diff --git a/drivers/Makefile b/drivers/Makefile
+index bdf1c66141c9..6092d3bb9757 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -58,6 +58,7 @@ obj-y				+= char/
+ 
+ # iommu/ comes before gpu as gpu are using iommu controllers
+ obj-y				+= iommu/
++obj-y				+= cohort_mmu/
+ 
+ # gpu/ comes after char for AGP vs DRM startup and after iommu
+ obj-y				+= gpu/
+diff --git a/drivers/cohort_mmu/Kconfig b/drivers/cohort_mmu/Kconfig
+new file mode 100644
+index 000000000000..97b73f258cfc
+--- /dev/null
++++ b/drivers/cohort_mmu/Kconfig
+@@ -0,0 +1,11 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# Cohort MMU device configuration
++#
++
++config COHORT_MMU
++    bool "COHORT MMU"
++    default y
++    select MMU_NOTIFIER
++    help
++        Instantiate Cohort MMU device and driver 
+diff --git a/drivers/cohort_mmu/Makefile b/drivers/cohort_mmu/Makefile
+new file mode 100644
+index 000000000000..609237179d7b
+--- /dev/null
++++ b/drivers/cohort_mmu/Makefile
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Makefile for a Cohort MMU driver.
++#
++
++obj-$(CONFIG_COHORT_MMU) += cohort_mmu.o
+diff --git a/drivers/cohort_mmu/cohort_mmu.c b/drivers/cohort_mmu/cohort_mmu.c
+new file mode 100644
+index 000000000000..2fef6c8353ed
+--- /dev/null
++++ b/drivers/cohort_mmu/cohort_mmu.c
+@@ -0,0 +1,206 @@
++/*
++ * Copyright (C) 2010-2012 Advanced Micro Devices, Inc.
++ * Author: Joerg Roedel <jroedel@suse.de>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published
++ * by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
++ */
++
++#define DRIVER_NAME "cohort_mmu"
++#define MAX_COHORT_TILE 2
++#define NUM_OF_RES 3
++#include "cohort_mmu.h"
++
++MODULE_LICENSE("GPL v2");
++MODULE_AUTHOR("Nazerke Turtayeva <nturtayeva@ucsb.edu>");
++
++/////////////
++// Structs //
++/////////////
++
++static int irq[MAX_COHORT_TILE];
++static int irq_cnt;
++static struct mm_struct *curr_mm;
++// static struct 
++static const struct mmu_notifier_ops iommu_mn = {
++	.invalidate_range_start = invalidate_tlb_start,
++	.invalidate_range_end   = invalidate_tlb_end,
++};
++
++static struct mmu_notifier mn = {
++	.ops = &iommu_mn,
++}; 
++
++//////////////////////////
++// Function Definitions //
++//////////////////////////
++
++// --> tile arguments are fixed, change this later
++// --> need to check whether tile conversion is correct here
++static irqreturn_t cohort_mmu_interrupt(int irq_n, void *dev_id){
++	PRINTBT
++	pr_info("Cohort MMU Interrupt Entered!\n");
++	uint64_t res = dec_get_tlb_fault(irq_n%(irq[0]));
++	uint32_t tile_ind = irq_n%(irq[0]);
++    pr_info("Get Page Fault %llx and show irq %d at core %d\n", res, irq_n, tile_ind);
++    
++	if (res != 0){
++        uint32_t * ptr = (uint32_t *)(res & 0xFFFFFFFFF0);
++        printk("T%llx\n",ptr);
++        dec_resolve_page_fault(tile_ind, (res & 0xF));
++        printk("R\n",res);
++		return IRQ_HANDLED;
++    } else{
++		return -1;
++	}	
++};
++
++void cohort_mn_register(uint64_t c_head, uint64_t p_head, uint64_t acc_addr, uint64_t backoff_val){
++	PRINTBT
++	// Extract curr process details
++	struct mm_struct *mm; 
++	mm      = get_task_mm(current);
++	mn.mm   = mm;
++	curr_mm = mm;
++
++	// Register current process
++	int err = mmu_notifier_register(&mn, curr_mm);
++
++	// ---> address from device tree here
++	uint32_t num = 1;
++
++	// Alloc tile and set TLB base
++	init_tile(num);
++ 
++	// Fill the fifo_ctrl_t struct members
++	cohort_on(c_head, p_head, acc_addr, backoff_val);
++	
++	// Open the comm-n with DEC queues to extract useful stats
++	// dec_open_producer(0);
++	// dec_open_consumer(0);
++	
++}
++EXPORT_SYMBOL(cohort_mn_register);
++
++static int cohort_mmu_probe(struct platform_device *ofdev)
++{	
++	pr_info("---> Cohort MMU Driver Probe v1.8 entered! %s\n", ofdev->resource->name);
++
++	struct device *dev = &ofdev->dev;
++	
++	dev_info(dev, "---> Cohort Device Structure extracted!\n");
++
++	irq_cnt = of_property_count_u32_elems(dev->of_node, "interrupts");
++
++	uint32_t num_tiles;
++	uint32_t status = of_property_read_u32(dev->of_node, "ucsbarchlab,number-of-cohorts", &num_tiles);
++	if (status < 0) {
++			dev_err(dev, "---> Can't read the property\n");
++			return -1;
++	}
++
++	int retval;
++
++	uint32_t i;
++
++	for (i = 0; i < irq_cnt; i++){
++		irq[i] = platform_get_irq(ofdev, i);
++		pr_info("IRQ line: %d\n", irq[i]);
++		if (irq[i] < 0) {
++			dev_err(dev, "---> no IRQ found\n");
++			return -1;
++		}
++
++		// listen for interrupts for a page fault
++		retval = request_irq(irq[i], cohort_mmu_interrupt, 0, dev_name(dev), dev);
++
++		dev_info(dev, "---> Cohort IRQ return value: %d\n", retval);
++
++		if (retval < 0){
++			dev_err(dev, "---> Can't request IRQ with retval: %d\n", retval);
++			return retval;
++		}
++	}
++
++	struct resource *res; 
++
++	// do an allocation and remap for every resource by each tile
++	uint32_t j;
++	for (j=0; j < irq_cnt; j++){
++		// res = platform_get_resource(ofdev, IORESOURCE_MEM, j*NUM_OF_RES);
++		// base[j] = devm_ioremap_resource(dev, res);
++		// if (IS_ERR(base[j])){
++		// 	return PTR_ERR(base[j]);
++		// }
++
++		res = platform_get_resource(ofdev, IORESOURCE_MEM, j*NUM_OF_RES+1);
++		mmub[j] = devm_ioremap_resource(dev, res);
++		if (IS_ERR(mmub[j])){
++			return PTR_ERR(mmub[j]);
++		}
++
++		res = platform_get_resource(ofdev, IORESOURCE_MEM, j*NUM_OF_RES+2);
++		dream_base[j] = devm_ioremap_resource(dev, res);
++		if (IS_ERR(dream_base[j])){
++			return PTR_ERR(dream_base[j]);
++		}
++
++	}
++
++	dev_info(dev, "---> Cohort Probe is successfully launched!\n");
++
++	return 0;
++}
++
++void cohort_mn_exit(void){
++	PRINTBT
++
++	// Close the queues and extract numbers
++	// dec_close_producer(0);
++	// dec_close_consumer(0);
++	// print_stats_fifos(1);
++
++    cohort_off();
++
++	mmu_notifier_unregister(&mn, curr_mm);
++
++}
++EXPORT_SYMBOL(cohort_mn_exit);
++
++static int cohort_mmu_remove(struct platform_device *ofdev){
++	PRINTBT
++
++	struct device *dev = &ofdev->dev;
++	free_irq(irq, dev);
++	
++	return 0;
++}
++
++/* Match table for OF platform binding */
++static const struct of_device_id cohort_of_match[] = {
++	{ .compatible = "ucsbarchlab,cohort-0.0.a", },
++	// { .compatible = "ucsbarchlab,cohort-0.0.1", },
++    { /* end of list */ },
++};
++MODULE_DEVICE_TABLE(of, cohort_of_match);
++
++static struct platform_driver cohort_of_driver = {
++	.driver = {
++		.name = DRIVER_NAME,
++		.of_match_table = cohort_of_match,
++	},
++	.probe		= cohort_mmu_probe,
++	.remove		= cohort_mmu_remove,
++};
++
++module_platform_driver(cohort_of_driver);
+\ No newline at end of file
+diff --git a/drivers/cohort_mmu/cohort_mmu.h b/drivers/cohort_mmu/cohort_mmu.h
+new file mode 100644
+index 000000000000..34d4f3de7ac8
+--- /dev/null
++++ b/drivers/cohort_mmu/cohort_mmu.h
+@@ -0,0 +1,195 @@
++#ifndef COHORT_MMU_H
++#define COHORT_MMU_H
++
++#include <linux/mmu_notifier.h>
++#include <linux/platform_device.h>
++#include <linux/mod_devicetable.h>
++#include <linux/mm_types.h>
++#include <linux/profile.h>
++#include <linux/module.h>
++#include <linux/sched.h>
++#include <linux/sched/mm.h>
++#include <linux/mmu_notifier.h>
++#include <linux/iommu.h>
++#include <linux/wait.h>
++#include <linux/pci.h>
++#include <linux/gfp.h>
++#include <linux/interrupt.h>
++#include <linux/skbuff.h>
++#include <linux/ioport.h> 
++#include <asm-generic/io.h> 
++#include <linux/of.h>
++
++#include "dcpn_compressed.h"
++
++#ifndef SERIALIZATION_VAL
++#define SERIALIZATION_VAL 1
++#endif
++
++#ifndef DESERIALIZATION_VAL
++#define DESERIALIZATION_VAL 1
++#endif
++
++#ifndef WAIT_COUNTER_VAL 
++#define WAIT_COUNTER_VAL 1
++#endif
++
++#ifndef BACKOFF_COUNTER_VAL
++#define BACKOFF_COUNTER_VAL 0x10
++#endif
++
++// from dcp_alloc.h
++uint64_t alloc_tile(uint64_t tiles, uint64_t * base);
++uint64_t dealloc_tiles(void);
++ 
++// from dcpn_compressed.h
++uint64_t dec_get_tlb_fault(uint64_t tile);
++void dec_resolve_page_fault(uint64_t tile, uint64_t conf_tlb_entry);
++int invalidate_tlb_start (struct mmu_notifier *mn, const struct mmu_notifier_range *range);
++void invalidate_tlb_end (struct mmu_notifier *mn, const struct mmu_notifier_range *range);
++
++// Cohort's Kernel API
++void fifo_start(uint64_t head_ptr, uint64_t meta_ptr, uint64_t tail_ptr, bool cohort_to_sw);
++void baremetal_write(uint32_t tile, uint64_t addr, uint64_t value);
++uint64_t uncached_read(uint32_t tile, uint64_t addr);
++
++void cohort_on(uint64_t c_head, uint64_t p_head, uint64_t acc_addr, uint64_t backoff_val);
++void cohort_off(void);
++void cohort_stop_monitors(void);
++void cohort_print_monitors(void);
++void cohort_print_debug_monitors(void);
++
++void fifo_start(uint64_t head_ptr, uint64_t meta_ptr, uint64_t tail_ptr, bool cohort_to_sw)
++{
++    PRINTBT
++
++    if (cohort_to_sw) {
++        // baremetal_write( 0, 3, head_ptr);
++        baremetal_write( 0, 3, head_ptr);
++        baremetal_write( 0, 4, meta_ptr);
++        baremetal_write( 0, 5, tail_ptr);
++    } else { 
++        baremetal_write( 0, 0, tail_ptr); // this is actually tail for consumer
++        baremetal_write( 0, 1, meta_ptr);
++        baremetal_write( 0, 2, head_ptr); 
++    }
++
++    __sync_synchronize();
++
++}
++
++void baremetal_write(uint32_t tile, uint64_t addr, uint64_t value){
++	PRINTBT
++    uint64_t write_addr = (addr*8) | (uint64_t)dream_base[tile]; 
++
++    #ifdef PRINT_ADDR
++	printk("Target DREAM addr: %lx, write config data: %lx\n", write_addr, (uint64_t)value);
++    #endif
++
++    iowrite64(value, write_addr);
++}
++
++uint64_t uncached_read(uint32_t tile, uint64_t addr){
++	PRINTBT
++    uint64_t read_addr = (addr*8) | (uint64_t) dream_base[tile]; 
++	uint64_t read_val = ioread64((void*) read_addr);
++	
++    #ifdef PRI
++	printk("Read value: %llx, from DREAM addr: %llx\n", read_val, read_addr);
++    #endif
++
++    return read_val;
++}
++
++void cohort_on(uint64_t c_head, uint64_t p_head, uint64_t acc_addr, uint64_t backoff_val)
++{   
++    PRINTBT
++    // Send queue addresses
++    uint64_t offset   = 128;
++    
++	fifo_start(c_head, c_head + offset, c_head + 2*offset, 0);
++	fifo_start(p_head, p_head + offset, p_head + 2*offset, 1);    
++
++    // Send acc-r address
++    baremetal_write(0, 6, acc_addr);
++
++    // Turn on the monitor
++    // Don't lower reset, but turn on and clear the monitor
++    uint64_t write_value = 6;
++    // uint64_t serialization_value = SERIALIZATION_VAL;
++    // uint64_t deserialization_value = DESERIALIZATION_VAL;
++    // uint64_t wait_counter = WAIT_COUNTER_VAL;
++    // uint64_t backoff_counter = BACKOFF_COUNTER_VAL;
++
++    // write_value |= backoff_counter << 48;
++    // write_value |= serialization_value << 32;
++    // write_value |= deserialization_value << 16;
++    // write_value |= wait_counter << 4;
++    // printk("d\n");
++    baremetal_write(0, 7, write_value);
++    __sync_synchronize();
++	
++    // Clear counter and turn on the monitor - later might move to user mode
++	unsigned long long int write_value_mon = 11;
++    uint64_t serialization_value_mon = SERIALIZATION_VAL;
++    uint64_t deserialization_value_mon = DESERIALIZATION_VAL;
++    uint64_t wait_counter_mon = WAIT_COUNTER_VAL;
++    uint64_t backoff_counter_mon = backoff_val;
++
++    write_value_mon |= backoff_counter_mon << 48;
++    write_value_mon |= serialization_value_mon << 32;
++    write_value_mon |= deserialization_value_mon << 16;
++    write_value_mon |= wait_counter_mon << 4;
++
++    // printk("d\n");
++    baremetal_write(0, 7, write_value_mon);
++    // printk("d\n");
++}
++
++void cohort_off(void)
++{
++    PRINTBT
++    cohort_stop_monitors();
++
++    #ifdef COHORT_DEBUG
++	cohort_print_monitors(c_id);
++	cohort_print_debug_monitors(c_id);
++    #endif
++
++    // Turn off the monitor
++    baremetal_write(0, 7, 0);
++    __sync_synchronize();
++
++    dec_def_flush_tlb(0);
++
++}
++
++void cohort_stop_monitors(void)
++{
++    PRINTBT
++    // Stop counter, but keep reset low
++    baremetal_write(0, 7, 1);
++}
++
++void cohort_print_monitors(void)
++{
++    PRINTBT
++	int i;
++    for (i=0;i< 35; i++) {
++        printk("%lx,",uncached_read(0, i));
++    }
++
++}
++
++void cohort_print_debug_monitors(void)
++{
++    PRINTBT
++    printk("here's the debug registers dump\n");
++    int i;
++	for (i=35;i< 55; i++) {
++        printk("dbg reg %d: %lx\n",i - 35, uncached_read(0, i));
++    }
++
++}
++
++#endif // COHORT_MMU_H
+\ No newline at end of file
+diff --git a/drivers/cohort_mmu/cohort_syscall.h b/drivers/cohort_mmu/cohort_syscall.h
+new file mode 100644
+index 000000000000..2c1b32e2c9cf
+--- /dev/null
++++ b/drivers/cohort_mmu/cohort_syscall.h
+@@ -0,0 +1,3 @@
++extern void cohort_mn_register(uint64_t c_head, uint64_t p_head, uint64_t acc_addr, uint64_t backoff_val);
++
++extern void cohort_mn_exit(void);
+\ No newline at end of file
+diff --git a/drivers/cohort_mmu/dcpn_compressed.h b/drivers/cohort_mmu/dcpn_compressed.h
+new file mode 100644
+index 000000000000..1e415f149d79
+--- /dev/null
++++ b/drivers/cohort_mmu/dcpn_compressed.h
+@@ -0,0 +1,361 @@
++
++void assert(int condition){
++    if (condition==0){
++        printk("ASSERT!!\n");
++    }
++}
++
++#define PRINTBT
++
++// #ifndef PRINTBT
++// #define PRINTBT printk("[KERNEL] %s\n", __func__);
++// #endif
++
++// #ifndef PRINT_ADDR
++// #define PRINT_ADDR;
++// #endif
++
++// #ifndef PRI
++// #define PRI;
++// #endif
++
++// #define DEC_DEBUG 1 // Do some runtime checks, but potentially slows
++
++#define DEBUG_INIT assert(initialized);
++#define DEBUG_NOT_INIT assert(!initialized);
++
++#include "dec_decoupling.h"
++
++//////////////////////////////////////
++//// OPEN/CLOSE PRODUCER/CONSUMER////
++/////////////////////////////////////
++
++uint32_t dec_open_producer(uint64_t qid) {
++  PRINTBT
++  while (!initialized);
++
++#if defined(DEC_DEBUG)
++  assert(fpid[qid] == INVALID_FIFO);
++#endif
++#ifdef RES
++  printk("inside RES\n");
++  ATOMIC_OP(result, 1, add, w);
++#endif
++  uint32_t tile = qid/queues_per_tile;
++  uint64_t fifo = base[tile] | ( (qid%queues_per_tile) << FIFO);
++#ifdef PRI
++  printk("fifo:%d\n",fifo);
++#endif
++  uint32_t res_producer_conf; 
++  // connect can return 0 if queue does not exist or if it is already taken 
++  do {res_producer_conf = *(volatile uint64_t*)(producer_conf_addr | fifo);
++#ifdef PRI
++    printk("OPROD:%d and %d\n",res_producer_conf, producer_conf_addr);
++#endif
++  } while (res_producer_conf == 0);
++  fpid[qid] = fifo;
++  return 1;
++}
++
++uint32_t dec_open_consumer(uint64_t qid) {
++  PRINTBT
++  while (!initialized);
++
++#if defined(DEC_DEBUG)
++  assert(fcid[qid] == INVALID_FIFO);
++#endif
++#ifdef RES
++  ATOMIC_OP(result, 1, add, w);
++#endif
++  uint32_t tile = qid/queues_per_tile;
++  uint64_t fifo = base[tile] | ( (qid%queues_per_tile) << FIFO);
++#ifdef PRI
++  printk("fifo:%d\n",fifo);
++#endif
++  uint32_t res_consumer_conf; 
++  // connect can return 0 if queue does not exist or if it is already taken 
++  do {res_consumer_conf = *(volatile uint64_t*)(consumer_conf_addr | fifo); 
++#ifdef PRI
++    printk("OCONS:%d and %d\n",res_consumer_conf, consumer_conf_addr);
++#endif
++  } while (res_consumer_conf == 0);
++  fcid[qid] = fifo;
++  return 1;
++}
++
++uint32_t dec_close_producer(uint64_t qid) {
++  PRINTBT
++  uint64_t fifo = fpid[qid];
++#ifdef PRI
++  printk("fifo:%d\n",fifo);
++#endif
++#if defined(DEC_DEBUG)
++  assert(fifo !=INVALID_FIFO);
++  //fpid[qid] = INVALID_FIFO;
++#endif
++  // close can return 0 if the queue does not exist or it is not configured by the core
++  volatile uint32_t res_producer_conf = *(volatile uint64_t*)(producer_dconf_addr | fifo);
++#ifdef PRI
++  printk("CPROD:%d and %d\n",res_producer_conf, producer_dconf_addr);
++#endif
++#ifdef RES
++  ATOMIC_OP(result, -1, add, w);
++#endif
++  return res_producer_conf;
++}
++
++uint32_t dec_close_consumer(uint64_t qid) {
++  PRINTBT
++  uint64_t fifo = fcid[qid];
++#ifdef PRI
++  printk("fifo:%d\n",fifo);
++#endif
++#if defined(DEC_DEBUG)
++  assert(fifo !=INVALID_FIFO);
++  //fcid[qid] = INVALID_FIFO;
++#endif
++  volatile uint32_t res_consumer_conf = *(volatile uint64_t*)(consumer_dconf_addr | fifo);
++#ifdef PRI
++  printk("CCONS:%d and %d\n",res_consumer_conf, consumer_dconf_addr);
++#endif
++#ifdef RES
++  ATOMIC_OP(result, -1, add, w);
++#endif
++  return res_consumer_conf;
++}
++
++//STATS
++uint64_t dec_fifo_stats(uint64_t qid, uint32_t stat, uint32_t* result) {
++  //TODO adapt to fetch only stat (key)
++  PRINTBT
++  volatile uint64_t res_stat = *(volatile uint64_t*)(stats_addr | fpid[qid]);
++  return res_stat;
++}
++
++void print_st(uint32_t id){
++  uint64_t stat = dec_fifo_stats(id,0,0);
++  stat = dec_fifo_stats(id,0,0);
++  uint32_t stat_c = (uint32_t) stat;
++  uint32_t stat_p = (stat >> 32);
++  stat = dec_fifo_stats(id,0,0);
++  stat_c += (uint32_t) stat;
++  stat_p += (stat >> 32);
++  if (stat_c > stat_p) stat = stat_c; else stat = stat_p;
++  printk("Execution time: %d\n",(int)stat);
++  stat = dec_fifo_stats(id,0,0);
++}
++
++void print_stats_fifos(uint32_t num){
++  uint32_t fifo_id;
++  for (fifo_id=0; fifo_id<num; fifo_id++)
++  {
++#ifdef PRI
++  printk("Stats for FIFO %d:\n", fifo_id);
++#endif
++  print_st(fifo_id);    
++  }
++}
++
++// TLB management
++// SNOOP TLB ENTRIES
++uint64_t dec_snoop_tlb_entry(uint64_t tile) {
++  PRINTBT
++  uint64_t res = *(volatile uint64_t *)(tlb_snoop_entry | mmub[tile]);
++  return res;
++}
++// GET PAGE FAULTS
++uint64_t dec_get_tlb_fault(uint64_t tile) {
++  PRINTBT
++  uint64_t res = *(volatile uint64_t *)(get_tlb_fault | mmub[tile]);
++  return res;
++}
++// FLUSH TLB
++uint64_t dec_def_flush_tlb (uint64_t tile) {
++  PRINTBT
++  uint64_t res = *(volatile uint64_t*)(tlb_flush | mmub[tile]);
++  return res;
++}
++
++int invalidate_tlb_start (struct mmu_notifier *mn, const struct mmu_notifier_range *range){
++  PRINTBT
++  printk("MMU flush called at: %llx and %llx\n", range->start, range->end);
++   // --> configure THIS to include the tile # smhow
++  uint64_t res = *(volatile uint64_t*)(tlb_flush | mmub[0]); 
++#ifdef PRI
++  printk("Dec flush tlb results:\n %llx", res);
++#endif
++  return 0;
++}
++
++void invalidate_tlb_end (struct mmu_notifier *mn, const struct mmu_notifier_range *range){
++
++}
++
++// CONFIG THE PAGE TABLE BASE OF THE TLB
++void dec_set_tlb_ptbase(uint64_t tile, uint64_t conf_tlb_addr) {
++  PRINTBT
++// conf_tlb_addr is 28 bits, so set to bits [27:0]
++// The other 36 bits of the data are as follow
++//     35 disable_int
++//     34 reserved
++//     33:32 chipid[7],chipid[0]
++//     31:28 fbits
++//     27:20 ypos
++//     19:12 xpos
++//     11:10  type
++//     9     threadid
++//     8     0:level, 1:edge
++//     7     0:rising, 1:falling
++//     6:0   source id
++  dec_def_flush_tlb(tile);
++  *(volatile uint64_t*)(conf_tlb_ptbase | mmub[tile]) = (conf_tlb_addr & 0x0FFFFFFFULL) | 0x0003001020000000;
++#ifdef PRI
++  printk("Config MAPLE ptbase %llx\n", (uint64_t*)conf_tlb_addr);
++#endif
++}
++// SET TLB ENTRY THRU DCP and RESOLVE PAGE FAULT if lower bits are set
++void dec_set_tlb_mmpage(uint64_t tile, uint64_t conf_tlb_entry) {
++  PRINTBT
++  *(volatile uint64_t*)(conf_tlb_mmpage | mmub[tile]) = conf_tlb_entry; 
++}
++// RESOLVE PAGE FAULT, but not load entry into TLB, let PTW do it
++void dec_resolve_page_fault(uint64_t tile, uint64_t conf_tlb_entry) {
++  PRINTBT
++  *(volatile uint64_t*)(resolve_tlb_fault | mmub[tile]) = conf_tlb_entry; 
++}
++// DISABLE TLB TRANSLATION
++void dec_disable_tlb(uint64_t tile) {
++  PRINTBT
++  *(volatile uint64_t*)(disable_tlb | mmub[tile]) = 0; 
++}
++
++//CLEANUP
++uint32_t dec_fifo_cleanup(uint32_t tile) {
++  PRINTBT
++#if defined(DEC_DEBUG)
++  //DEBUG_INIT;
++#endif
++  uint32_t i;
++  for (i=0; i<tile;i++){
++    volatile uint32_t res_reset = *(volatile uint32_t*)(destroy_tile_addr | base[i]);
++#ifdef PRI
++    printk("RESET:%d\n",res_reset);
++#endif
++  }
++  return 1; //can this fail? security issues?
++}
++
++/////////////////
++/// INIT TILE ///
++/////////////////
++
++/* No longer used, confirmed by Naz Mar '23
++uint32_t config_loop_unit(int config_tiles, void * A, void * B, uint32_t op) {
++  uint64_t cr_conf_A = op*BYTE;
++  // The last bit of cr_conf_A indicates whether the B[i] load is coherent or not (1: coherent)
++  // Whether A[B[i]] is loaded coherently, depends on the 'op'
++  // LOOP_TLOAD32 48 (non coherent), vs  LOOP_LLC_32  52 (coherent)
++#ifndef COHERENT
++  #define COHERENT 1
++#endif
++
++#if COHERENT==1
++  cr_conf_A |= 1 << FIFO;
++#endif
++
++  if (A!=0 || B!=0){
++    int j;
++    for (j=0; j<config_tiles; j++){
++      *(volatile uint64_t*)(cr_conf_A | base[j]) = (uint64_t)A;
++      if (B!=0) *(volatile uint64_t*)(base_addr32 | base[j]) = (uint64_t)B;
++    }
++  }
++}
++*/
++
++void init_tile(uint32_t num){
++  PRINTBT
++  uint32_t size = DCP_SIZE_64;
++  if (num == 2) 
++    size=DCP_SIZE_64;
++  else if (num > 2)
++    size=DCP_SIZE_32;
++  uint32_t res = dec_fifo_init(num, size);
++}
++
++uint32_t dec_fifo_init(uint32_t count, uint32_t size) {
++  PRINTBT
++#ifdef SWDAE
++  dec2_fifo_init(1, DCP_SIZE_64);
++#endif
++  return dec_fifo_init_conf(count, size, 0, 0, 0);
++}
++
++// changing the return type of the function to include errors from uint32_t
++int32_t dec_fifo_init_conf(uint32_t count, uint32_t size, void * A, void * B, uint32_t op) {
++  PRINTBT
++#if defined(DEC_DEBUG)
++  // hardware should also ignore init messages once to a tile which is already initialized
++  DEBUG_NOT_INIT;
++  uint32_t i;
++  for(i=0; i<MAX_QUEUES;i++){
++    fcid[i] = INVALID_FIFO;
++    fpid[i] = INVALID_FIFO;
++  }
++  assert (count); //check that count is bigger than 0
++#endif
++  
++  uint32_t allocated_tiles = count;
++  uint64_t conf_tlb_addr;
++
++  // save page table base address
++	uint64_t virt_base = (uint64_t)(current->mm->pgd);
++
++#ifdef PRI
++	printk("Cohort MMU: PT base address %llx\n", virt_base);
++#endif
++
++  conf_tlb_addr = virt_to_phys((void *)virt_base) >> 12; 
++
++#ifdef PRI
++  printk("Cohort MMU: conf tlb addr %llx\n", conf_tlb_addr);
++#endif
++  
++  if (conf_tlb_addr == -1 ) {
++    return -1;
++  }
++
++  //printDebug(dec_fifo_debug(0,2));
++  // dec_fifo_cleanup(allocated_tiles);
++  __sync_synchronize(); //Compiler should not reorder the next load
++  //printDebug(dec_fifo_debug(0,2));
++  uint32_t k = 0;
++  uint32_t res_producer_conf;
++  do { // Do the best allocation based on the number of tiles!
++    // INIT_TILE: Target to allocate "len" queues per Tile
++//     uint64_t addr_maple = (base[k] | (size << FIFO));
++//     res_producer_conf = *(volatile uint32_t*)addr_maple;
++// #ifdef PRI
++//     printk("Target MAPLE %d: address %llx\n", k, (uint32_t*)addr_maple);
++//     printk("Target MAPLE %d: res %d, now config TLB\n", k, res_producer_conf);
++// #endif
++
++    dec_set_tlb_ptbase(k, conf_tlb_addr);
++
++    k++;
++  } while (k < allocated_tiles);
++  // count configured tiles
++  uint32_t config_tiles = k;
++  // if (!res_producer_conf) config_tiles--;
++
++  // config_loop_unit(config_tiles,A,B,op);
++
++  initialized = 1;
++  uint32_t res = config_tiles*queues_per_tile;
++
++#ifdef PRI
++  printk("INIT: res 0x%08x\n", ((uint32_t)res) & 0xFFFFFFFF);
++#endif
++
++  return res;
++}
+\ No newline at end of file
+diff --git a/drivers/cohort_mmu/dec_decoupling.h b/drivers/cohort_mmu/dec_decoupling.h
+new file mode 100644
+index 000000000000..185e484f6318
+--- /dev/null
++++ b/drivers/cohort_mmu/dec_decoupling.h
+@@ -0,0 +1,125 @@
++// #include <stdint.h>
++
++#define QUEUE_SIZE 128
++#define MAX_QUEUES 256
++#define MAX_TILES 16
++#define INVALID_FIFO 65536
++
++#define BYTE         8
++#define TILE_X       28
++#define TILE_Y       24
++#define WIDTH        2
++#define FIFO         9
++#define BASE_MAPLE 0xe100800000
++#define BASE_SPD   0xe100900000
++#define BASE_MMU   0xe100A00000
++#define BASE_DREAM 0xe100B00000
++#define BASE_NIBBL 0xe100C00000
++
++#define PG_SIZE ((unsigned long)(1 << 12))
++
++//static variables
++static uint32_t num_tiles;
++static volatile uint32_t initialized = 0;
++static uint32_t queues_per_tile;
++static uint64_t fpid[MAX_QUEUES];
++static uint64_t fcid[MAX_QUEUES];
++static uint64_t base[MAX_TILES];
++static uint64_t mmub[MAX_TILES];
++static uint64_t dream_base[MAX_TILES];
++volatile static int result = 0;
++
++#define DCP_SIZE_8  0
++#define DCP_SIZE_16 1
++#define DCP_SIZE_32 2
++#define DCP_SIZE_48 3
++#define DCP_SIZE_64 4
++#define DCP_SIZE_80 5
++#define DCP_SIZE_96 6
++#define DCP_SIZE_128 7
++
++///LIMA
++#define LOOP_TLOAD32 48 // Set Tload 32 bits
++#define LOOP_TLOAD64 49 // Set Tload 64 bits
++#define LOOP_PRODUCE 50 // Set Produce
++#define LOOP_LLC_32  52 // Set LLC load 32 bits
++#define LOOP_LLC_64  53 // Set LLC load 64 bits
++#define LOOP_PREFETCH 54 // Set Prefetch
++static uint64_t push_loop = (uint64_t)(14*BYTE);
++
++//CONSUME/PRODUCE
++static uint64_t cons_addr = (uint64_t)(7*BYTE);
++static uint64_t prod_addr = (uint64_t)(8*BYTE);
++//TLOAD
++static uint64_t tload_addr32 = (uint64_t)(10*BYTE);
++static uint64_t tload_addr64 = (uint64_t)(11*BYTE);
++//ATOMICs
++static uint64_t add_addr  = (uint64_t)(32*BYTE);
++static uint64_t and_addr  = (uint64_t)(33*BYTE);
++static uint64_t or_addr   = (uint64_t)(34*BYTE);
++static uint64_t xor_addr  = (uint64_t)(35*BYTE);
++static uint64_t max_addr  = (uint64_t)(36*BYTE);
++static uint64_t maxu_addr = (uint64_t)(37*BYTE);
++static uint64_t min_addr  = (uint64_t)(38*BYTE);
++static uint64_t minu_addr = (uint64_t)(39*BYTE);
++static uint64_t swap_addr = (uint64_t)(40*BYTE);
++static uint64_t cas1_addr = (uint64_t)(41*BYTE);
++static uint64_t cas2_addr = (uint64_t)(42*BYTE);
++static uint64_t prefetch_addr = (uint64_t)(43*BYTE);
++static uint64_t llcload_addr32 = (uint64_t)(44*BYTE);
++static uint64_t llcload_addr64 = (uint64_t)(45*BYTE);
++
++//CONFIG
++static uint64_t destroy_tile_addr  = (uint64_t)(1*BYTE);
++//CONFIG B base
++static uint64_t base_addr32 = (uint64_t)(57*BYTE);
++static uint64_t base_addr64 = (uint64_t)(58*BYTE);
++
++//UNUSED
++static uint64_t fifoadd_addr  = (uint64_t)(6*BYTE);
++static uint64_t fifoclr_addr  = (uint64_t)(9*BYTE);
++static uint64_t stats_addr    = (uint64_t)(12*BYTE);
++static uint64_t debug_addr    = (uint64_t)(13*BYTE);
++
++//CONF TLB (only on the MMU page)
++static uint64_t tlb_flush            = (uint64_t)(13*BYTE);
++static uint64_t get_tlb_fault        = (uint64_t)(13*BYTE | 1 << FIFO);
++static uint64_t tlb_snoop_entry      = (uint64_t)(13*BYTE | 2 << FIFO);
++static uint64_t disable_tlb          = (uint64_t)(15*BYTE);
++static uint64_t conf_tlb_ptbase      = (uint64_t)(15*BYTE | 1 << FIFO);
++static uint64_t resolve_tlb_fault    = (uint64_t)(15*BYTE | 2 << FIFO);
++static uint64_t conf_tlb_mmpage      = (uint64_t)(15*BYTE | 6 << FIFO);
++
++//CONNECT
++static uint64_t producer_conf_addr  = (uint64_t)(2*BYTE);
++static uint64_t consumer_conf_addr  = (uint64_t)(3*BYTE);
++static uint64_t producer_dconf_addr = (uint64_t)(4*BYTE);
++static uint64_t consumer_dconf_addr = (uint64_t)(5*BYTE);
++
++// Function declarations
++uint32_t dec_open_producer(uint64_t qid);
++uint32_t dec_open_consumer(uint64_t qid);
++uint32_t dec_close_producer(uint64_t qid);
++uint32_t dec_close_consumer(uint64_t qid);
++
++uint64_t dec_fifo_stats(uint64_t qid, uint32_t stat, uint32_t* result);
++void print_st(uint32_t id);
++void print_stats_fifos(uint32_t num);
++
++uint64_t dec_snoop_tlb_entry(uint64_t tile);
++uint64_t dec_get_tlb_fault(uint64_t tile);
++uint64_t dec_def_flush_tlb (uint64_t tile);
++int invalidate_tlb_start (struct mmu_notifier *mn, const struct mmu_notifier_range *range);
++void invalidate_tlb_end (struct mmu_notifier *mn, const struct mmu_notifier_range *range);					
++
++void dec_set_tlb_mmpage(uint64_t tile, uint64_t conf_tlb_entry);
++void dec_set_tlb_mmpage(uint64_t tile, uint64_t conf_tlb_entry);
++void dec_resolve_page_fault(uint64_t tile, uint64_t conf_tlb_entry);
++void dec_disable_tlb(uint64_t tile);
++uint32_t dec_fifo_cleanup(uint32_t tile); 
++
++uint32_t config_loop_unit(int config_tiles, void * A, void * B, uint32_t op);
++
++void init_tile(uint32_t num);
++uint32_t dec_fifo_init(uint32_t count, uint32_t size);
++int32_t dec_fifo_init_conf(uint32_t count, uint32_t size, void * A, void * B, uint32_t op);
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 45fa180cc56a..b380304715e3 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -887,7 +887,8 @@ __SYSCALL(__NR_futex_waitv, sys_futex_waitv)
+ __SYSCALL(__NR_set_mempolicy_home_node, sys_set_mempolicy_home_node)
+ 
+ #undef __NR_syscalls
+-#define __NR_syscalls 451
++
++#define __NR_syscalls 451 + 1
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/scripts/dtc/dtc-lexer.l b/scripts/dtc/dtc-lexer.l
+index de60a70b6bdb..1871ee45d4a0 100644
+--- a/scripts/dtc/dtc-lexer.l
++++ b/scripts/dtc/dtc-lexer.l
+@@ -23,6 +23,7 @@ LINECOMMENT	"//".*\n
+ #include "srcpos.h"
+ #include "dtc-parser.tab.h"
+ 
++extern YYLTYPE yylloc;
+ extern bool treesource_error;
+ 
+ /* CAUTION: this will stop working if we ever use yyless() or yyunput() */
+diff --git a/tools/arch/riscv/include/uapi/asm/unistd.h b/tools/arch/riscv/include/uapi/asm/unistd.h
+index f506cca520b0..7f8225517643 100644
+--- a/tools/arch/riscv/include/uapi/asm/unistd.h
++++ b/tools/arch/riscv/include/uapi/asm/unistd.h
+@@ -40,3 +40,14 @@
+ #define __NR_riscv_flush_icache (__NR_arch_specific_syscall + 15)
+ #endif
+ __SYSCALL(__NR_riscv_flush_icache, sys_riscv_flush_icache)
++
++#ifndef __NR_riscv_conf_iommu
++#define __NR_riscv_conf_iommu (__NR_arch_specific_syscall + 14)
++#endif
++
++__SYSCALL(__NR_riscv_conf_iommu, sys_riscv_conf_iommu)
++
++#ifndef __NR_riscv_conf_iommu_exit
++#define __NR_riscv_conf_iommu_exit (__NR_arch_specific_syscall + 13)
++#endif
++__SYSCALL(__NR_riscv_conf_iommu_exit, sys_riscv_conf_iommu_exit)
+-- 
+2.25.1
+
